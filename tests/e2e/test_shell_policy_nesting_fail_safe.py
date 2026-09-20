@@ -59,9 +59,7 @@ def _result(response: PolicyResponse | None) -> str | None:
 )
 def test_github_policy_never_abstains_on_nested_eval(depth: int, expected: str) -> None:
     """A gated ``git push`` stays gated no matter how deep the eval nesting."""
-    policy = github_policy(
-        read_all=True, write_repos=["allowed/repo"], write_branches=["main"]
-    )
+    policy = github_policy(read_all=True, write_repos=["allowed/repo"], write_branches=["main"])
     command = _eval_wrapped(depth, "git push https://github.com/example/restricted main")
 
     response = policy(_shell_event(command))
