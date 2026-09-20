@@ -92,9 +92,7 @@ guardrails:
 
 
 @contextmanager
-def _gated_session(
-    base_url: str, runner_id: str, mock_url: str, command: str
-) -> Iterator[str]:
+def _gated_session(base_url: str, runner_id: str, mock_url: str, command: str) -> Iterator[str]:
     """A runner-bound session whose mock-LLM turn runs one gated command.
 
     :param base_url: Spawned server base URL.
@@ -201,8 +199,7 @@ def test_env_split_push_to_unlisted_repo_is_denied(
 
         outputs = _tool_outputs(live_server, session_id)
         assert any(_REPO_DENY_SENTINEL in output for output in outputs), (
-            "push to a non-allowlisted repo was not denied; "
-            f"tool outputs: {outputs!r}"
+            f"push to a non-allowlisted repo was not denied; tool outputs: {outputs!r}"
         )
 
 
