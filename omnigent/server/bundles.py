@@ -66,7 +66,7 @@ def _cwd_escapes_workspace(spec_cwd: str) -> bool:
     ``copytree`` source, exposing the host filesystem.
     """
     posix, win = PurePosixPath(spec_cwd), PureWindowsPath(spec_cwd)
-    return posix.is_absolute() or win.is_absolute() or ".." in posix.parts or ".." in win.parts
+    return posix.is_absolute() or bool(win.anchor) or ".." in posix.parts or ".." in win.parts
 
 
 def _reject_escaping_cwd(cwd: str | None) -> None:
