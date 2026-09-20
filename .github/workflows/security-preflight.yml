@@ -1,0 +1,470 @@
+name: Security fix preflight
+run-name: Security fix preflight (${{ inputs.ref }})
+'on':
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Exact fix commit to validate before opening its upstream PR
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: security-preflight-${{ inputs.ref }}
+  cancel-in-progress: false
+jobs:
+  unit_gate:
+    uses: ./.github/workflows/security-gate.yml
+  unit_pytest:
+    name: Pytest (${{ matrix.group }})
+    needs:
+    - unit_gate
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - group: runtime-harnesses
+          paths: tests/runtime/harnesses
+          dist: worksteal
+        - group: runtime-policies
+          paths: tests/runtime/policies
+        - group: runtime-core
+          paths: tests/runtime --ignore=tests/runtime/harnesses --ignore=tests/runtime/policies
+          dist: worksteal
+        - group: inner-rest
+          paths: tests/inner
+        - group: tools
+          paths: tests/tools tests/test_errors.py
+        - group: repl-sdk
+          paths: tests/frontends tests/repl tests/terminals
+        - group: server-approvals
+          paths: tests/server/integration/test_sessions_permission_request_hook.py tests/server/integration/test_sessions_elicitation_resolve_url.py tests/server/integration/test_sessions_policy_evaluate.py
+          workers: '4'
+        - group: server-integration
+          paths: tests/server/integration --ignore=tests/server/integration/test_sessions_permission_request_hook.py --ignore=tests/server/integration/test_sessions_elicitation_resolve_url.py --ignore=tests/server/integration/test_sessions_policy_evaluate.py
+          workers: '4'
+          dist: worksteal
+        - group: server-rest
+          paths: tests/server --ignore=tests/server/integration tests/onboarding
+          workers: '4'
+        - group: spec-llms
+          paths: tests/spec tests/llms
+        - group: integration-mock
+          paths: tests/integration
+          workers: '0'
+        - group: runner-app
+          paths: tests/runner
+          dist: worksteal
+        - group: stores
+          paths: tests/stores
+          dist: worksteal
+        - group: misc
+          paths: tests --ignore=tests/e2e --ignore=tests/integration --ignore=tests/runtime --ignore=tests/inner --ignore=tests/tools --ignore=tests/test_errors.py --ignore=tests/frontends --ignore=tests/repl --ignore=tests/terminals --ignore=tests/server --ignore=tests/onboarding --ignore=tests/spec --ignore=tests/llms --ignore=tests/codex_parity --ignore=tests/runner --ignore=tests/stores
+          dist: worksteal
+        - group: databricks
+          paths: tests/db tests/deploy tests/server/test_smart_routing.py
+          extra: databricks
+          markexpr: databricks
+        - group: slack
+          paths: integrations/slack/tests
+          extra: slack
+    steps:
+    - name: Check out repo
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      with:
+        ref: ${{ inputs.ref }}
+    - name: Set up Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      with:
+        python-version-file: .python-version
+    - name: Set up uv
+      uses: ./.github/actions/setup-uv
+      with:
+        enable-cache: true
+    - name: Install test system dependencies
+      run: "sudo apt-get update\nsudo apt-get install -y ripgrep bubblewrap tmux\nif [ \"${{ matrix.group }}\" = \"inner-rest\" ]; then\n  sudo apt-get install -y --no-install-recommends dbus-daemon gnome-keyring\nfi\nsudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0\n"
+    - name: Cache virtualenv
+      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+      with:
+        path: .venv
+        key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+    - name: Install dependencies
+      run: uv sync --locked --extra all --group test ${{ matrix.extra && format('--extra {0}', matrix.extra) || '' }}
+    - name: Run pytest
+      shell: bash
+      env:
+        PYTHONFAULTHANDLER: '1'
+        PYTEST_PROGRESS_LOG_DIR: artifacts/progress
+        OMNIGENT_TOKEN_USAGE_JSON: artifacts/tokens-${{ matrix.group }}.json
+        COVERAGE_FILE: ${{ runner.temp }}/omnigent-coverage/.coverage.${{ matrix.group }}
+        COVERAGE_CORE: sysmon
+        OMNIGENT_TEST_TIMEOUT_SCALE: '4'
+      run: "mkdir -p artifacts artifacts/progress \"$(dirname \"$COVERAGE_FILE\")\"\n# matrix.paths is unquoted on purpose: it word-splits into pytest args.\n# shellcheck disable=SC2086\nenv -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u DATABRICKS_TOKEN \\\n  uv run pytest ${{ matrix.paths }} \\\n    -m \"${{ matrix.markexpr || 'not databricks' }}\" \\\n    -n ${{ matrix.workers || '8' }} \\\n    --dist=${{ matrix.dist || 'loadfile' }} \\\n    --timeout=${{ matrix.timeout || '300' }} \\\n    --junitxml=artifacts/pytest-${{ matrix.group }}.xml \\\n    --cov=omnigent --cov-report= \\\n    -v --tb=long --showlocals --log-level=INFO -r a \\\n    || { rc=$?; [ \"$rc\" -eq 5 ] && echo \"::notice::No tests collected in this shard; treating as a pass.\" || exit \"$rc\"; }\n"
+    - name: Stage coverage data for upload
+      if: always()
+      shell: bash
+      run: "cov_file=\"${{ runner.temp }}/omnigent-coverage/.coverage.${{ matrix.group }}\"\nif [[ -f \"$cov_file\" ]]; then\n  cp \"$cov_file\" \"artifacts/.coverage.${{ matrix.group }}\"\nelse\n  echo \"::notice::No coverage data file at $cov_file; nothing to stage.\"\nfi\n"
+    - name: Upload pytest artifacts
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: pytest-${{ matrix.group }}-${{ github.run_id }}
+        path: artifacts/
+        retention-days: 14
+        include-hidden-files: true
+    env:
+      OMNIGENT_SKIP_WEB_UI: 'true'
+      UV_INDEX_URL: https://pypi.org/simple
+      PIP_INDEX_URL: https://pypi.org/simple
+  unit_stores-postgres:
+    name: Pytest (stores-postgres)
+    needs:
+    - unit_gate
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: omnigent
+          POSTGRES_DB: omnigent_root
+        ports:
+        - 5432:5432
+        options: --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      with:
+        ref: ${{ inputs.ref }}
+    - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      with:
+        python-version-file: .python-version
+    - uses: ./.github/actions/setup-uv
+      with:
+        enable-cache: true
+    - name: Install dependencies
+      run: uv sync --locked --extra all --group test --extra databricks
+    - name: Run store + DB tests against PostgreSQL
+      env:
+        OMNIGENT_TEST_DB_URI: postgresql+psycopg://postgres:omnigent@localhost:5432/omnigent_root
+      run: "uv run pytest tests/stores tests/db \\\n  -m \"not databricks\" \\\n  -n 4 \\\n  --dist=loadfile \\\n  --timeout=300 \\\n  --junitxml=artifacts/pytest-stores-postgres.xml\n"
+    - if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: pytest-stores-postgres-${{ github.run_id }}
+        path: artifacts/
+        retention-days: 14
+    env:
+      OMNIGENT_SKIP_WEB_UI: 'true'
+      UV_INDEX_URL: https://pypi.org/simple
+      PIP_INDEX_URL: https://pypi.org/simple
+  unit_stores-cockroachdb:
+    name: Pytest (stores-crdb-${{ matrix.crdb_version }})
+    needs:
+    - unit_gate
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - crdb_version: 23.2.28
+          crdb_service: crdb-23-2-28
+          crdb_port: 26323
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      with:
+        ref: ${{ inputs.ref }}
+    - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      with:
+        python-version-file: .python-version
+    - uses: ./.github/actions/setup-uv
+      with:
+        enable-cache: true
+    - name: Start CockroachDB
+      run: "docker compose -f deploy/cockroachdb/docker-compose.yml up \\\n  --detach --wait --wait-timeout 90 \"${{ matrix.crdb_service }}\"\nif [[ \"${{ matrix.crdb_version }}\" == \"23.2.28\" ]]; then\n  docker compose -f deploy/cockroachdb/docker-compose.yml exec -T \\\n    \"${{ matrix.crdb_service }}\" cockroach sql --insecure \\\n    --execute=\"SET CLUSTER SETTING sql.txn.read_committed_isolation.enabled = true\"\nfi\n"
+    - name: Install dependencies
+      run: uv sync --locked --extra all --extra cockroachdb --group test
+    - name: Run store + DB tests against CockroachDB
+      env:
+        OMNIGENT_TEST_DB_URI: cockroachdb+psycopg://root@localhost:${{ matrix.crdb_port }}/defaultdb?sslmode=disable
+      run: "uv run pytest tests/stores tests/db \\\n  -m \"not databricks\" \\\n  -n 4 \\\n  --dist=loadfile \\\n  --timeout=300 \\\n  --junitxml=artifacts/pytest-stores-crdb.xml\n"
+    - if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: pytest-stores-crdb-${{ matrix.crdb_version }}-${{ github.run_id }}
+        path: artifacts/
+        retention-days: 14
+    env:
+      OMNIGENT_SKIP_WEB_UI: 'true'
+      UV_INDEX_URL: https://pypi.org/simple
+      PIP_INDEX_URL: https://pypi.org/simple
+  unit_stores-mysql:
+    name: Pytest (stores-mysql)
+    needs:
+    - unit_gate
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: omnigent
+          MYSQL_DATABASE: omnigent_root
+        ports:
+        - 3306:3306
+        options: --health-cmd "mysqladmin ping -h 127.0.0.1 -u root -pomnigent" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      with:
+        ref: ${{ inputs.ref }}
+    - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      with:
+        python-version-file: .python-version
+    - uses: ./.github/actions/setup-uv
+      with:
+        enable-cache: true
+    - name: Install system MySQL client library
+      run: sudo apt-get update -qq && sudo apt-get install -y -q libmysqlclient-dev
+    - name: Install dependencies
+      run: uv sync --locked --extra all --group test --extra databricks && uv pip install mysqlclient
+    - name: Run store + DB tests against MySQL
+      env:
+        OMNIGENT_TEST_DB_URI: mysql+mysqldb://root:omnigent@127.0.0.1:3306/omnigent_root
+      run: "uv run pytest tests/stores tests/db \\\n  -m \"not databricks\" \\\n  -n 4 \\\n  --dist=loadfile \\\n  --timeout=300 \\\n  --junitxml=artifacts/pytest-stores-mysql.xml\n"
+    - if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: pytest-stores-mysql-${{ github.run_id }}
+        path: artifacts/
+        retention-days: 14
+    env:
+      OMNIGENT_SKIP_WEB_UI: 'true'
+      UV_INDEX_URL: https://pypi.org/simple
+      PIP_INDEX_URL: https://pypi.org/simple
+  unit_codex-parity:
+    name: Pytest (codex-parity)
+    needs:
+    - unit_gate
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - name: Check out repo
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      with:
+        ref: ${{ inputs.ref }}
+    - name: Set up Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      with:
+        python-version-file: .python-version
+    - name: Set up uv
+      uses: ./.github/actions/setup-uv
+      with:
+        enable-cache: true
+    - name: Set up Rust toolchain
+      uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+      with:
+        toolchain: stable
+    - name: Capture Rust version
+      id: rustc
+      run: echo "version=$(rustc --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+    - name: Cache parity sidecar binary
+      id: sidecar-cache
+      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+      with:
+        path: .tmp-codex-parity-target/debug/codex-parity-sidecar
+        key: codex-parity-bin-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
+    - name: Set up pnpm
+      uses: ./.github/actions/setup-pnpm
+    - name: Install codex CLI
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
+      with:
+        harness: codex
+    - name: Cache virtualenv
+      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+      with:
+        path: .venv
+        key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+    - name: Install dependencies
+      run: uv sync --locked --extra all --group test
+    - name: Build parity sidecar
+      if: steps.sidecar-cache.outputs.cache-hit != 'true'
+      run: "cargo build \\\n  --manifest-path tests/codex_parity/sidecar/Cargo.toml \\\n  --target-dir .tmp-codex-parity-target\n"
+    - name: Run codex parity tests
+      shell: bash
+      env:
+        PYTHONFAULTHANDLER: '1'
+        CODEX_PARITY_SIDECAR_BIN: ${{ github.workspace }}/.tmp-codex-parity-target/debug/codex-parity-sidecar
+      run: "mkdir -p artifacts\nenv -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u DATABRICKS_TOKEN \\\n  uv run pytest tests/codex_parity/ \\\n    --codex-parity \\\n    --timeout=300 \\\n    --junitxml=artifacts/pytest-codex-parity.xml \\\n    -v --tb=long --showlocals --log-level=INFO -r a\n"
+    - name: Upload pytest artifacts
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: pytest-codex-parity-${{ github.run_id }}
+        path: artifacts/
+        retention-days: 14
+    env:
+      OMNIGENT_SKIP_WEB_UI: 'true'
+      UV_INDEX_URL: https://pypi.org/simple
+      PIP_INDEX_URL: https://pypi.org/simple
+  unit_coverage-report:
+    name: Coverage report
+    needs:
+    - unit_pytest
+    if: ${{ success() && !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - name: Check out repo
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      with:
+        persist-credentials: false
+        ref: ${{ inputs.ref }}
+    - name: Set up Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      with:
+        python-version-file: .python-version
+    - name: Install coverage
+      run: pip install "coverage>=7"
+    - name: Download shard coverage data
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        pattern: pytest-*
+        path: covdata
+        merge-multiple: true
+    - name: Combine + report
+      shell: bash
+      run: "shopt -s globstar nullglob\nfiles=(covdata/**/.coverage.*)\nmkdir -p coverage-summary\nif [[ ${#files[@]} -eq 0 ]]; then\n  echo \"::warning::No coverage data files found; skipping coverage report.\"\n  exit 0\nfi\necho \"Combining ${#files[@]} shard data file(s).\"\ncoverage combine \"${files[@]}\"\n# --ignore-errors: a plain checkout lacks uv-sync-generated files.\ncoverage report --format=markdown --ignore-errors > \"$RUNNER_TEMP/coverage-report.md\"\n{ echo \"## Coverage\"; echo; cat \"$RUNNER_TEMP/coverage-report.md\"; } >> \"$GITHUB_STEP_SUMMARY\"\ncoverage xml -o coverage-summary/coverage.xml --ignore-errors\npython .github/scripts/ci/coverage-total.py \"$RUNNER_TEMP/coverage-report.md\" > coverage-summary/total.txt\necho \"Total coverage: $(cat coverage-summary/total.txt)%\"\n"
+    - name: Upload coverage summary
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: coverage-summary-${{ github.run_id }}
+        path: coverage-summary/
+        retention-days: 14
+        if-no-files-found: ignore
+    env:
+      OMNIGENT_SKIP_WEB_UI: 'true'
+      UV_INDEX_URL: https://pypi.org/simple
+      PIP_INDEX_URL: https://pypi.org/simple
+  lint_gate:
+    uses: ./.github/workflows/security-gate.yml
+  lint_pre-commit:
+    name: Pre-commit checks
+    needs:
+    - lint_gate
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+    - name: Check out repo
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      with:
+        ref: ${{ inputs.ref }}
+    - name: Set up Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      with:
+        python-version-file: .python-version
+    - name: Check uv.lock uses the public PyPI index
+      run: python scripts/normalize_uv_lock_registry.py --check uv.lock
+    - name: Set up uv
+      uses: ./.github/actions/setup-uv
+      with:
+        enable-cache: true
+    - name: Cache virtualenv
+      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+      with:
+        path: .venv
+        key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+    - name: Install dependencies
+      run: "uv sync --locked --group lint \\\n  --extra hindsight \\\n  --extra nimble \\\n  --extra s3 \\\n  --extra tracing\n"
+    - name: Set up pnpm
+      uses: ./.github/actions/setup-pnpm
+    - name: Install TypeScript dependencies
+      env:
+        NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+      run: pnpm install --frozen-lockfile --filter web --filter omnigent-vscode
+    - name: Check pnpm-lock.yaml is up to date
+      env:
+        NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+      run: "pnpm install --lockfile-only\ngit diff --exit-code pnpm-lock.yaml || {\n  echo \"::error::pnpm-lock.yaml is out of date. Run 'pnpm install --lockfile-only' at the repo root and commit the result.\"\n  exit 1\n}\n"
+    - name: Check pnpm overrides satisfy declared ranges
+      run: .venv/bin/python dev/lint/lint_pnpm_override_consistency.py
+    - name: Install ktlint
+      env:
+        KTLINT_VERSION: 1.8.0
+        KTLINT_SHA256: a3fd620207d5c40da6ca789b95e7f823c54e854b7fade7f613e91096a3706d75
+      run: "curl -sSLf \\\n  \"https://github.com/ktlint/ktlint/releases/download/${KTLINT_VERSION}/ktlint\" \\\n  -o /tmp/ktlint\necho \"${KTLINT_SHA256}  /tmp/ktlint\" | sha256sum -c\nchmod +x /tmp/ktlint\nsudo mv /tmp/ktlint /usr/local/bin/ktlint\n"
+    - name: Run formatting, lint, and type checks
+      run: uv run pre-commit run --all-files --show-diff-on-failure
+    env:
+      OMNIGENT_SKIP_WEB_UI: 'true'
+      UV_INDEX_URL: https://pypi.org/simple
+      PIP_INDEX_URL: https://pypi.org/simple
+  lint_version-lockstep:
+    name: Version lockstep check
+    needs:
+    - lint_gate
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - name: Check out repo
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      with:
+        ref: ${{ inputs.ref }}
+    - name: Set up Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      with:
+        python-version-file: .python-version
+    - name: All version locations agree
+      run: 'python -m pip install --quiet --disable-pip-version-check packaging
+
+        python scripts/update_versions.py check
+
+        '
+    env:
+      OMNIGENT_SKIP_WEB_UI: 'true'
+      UV_INDEX_URL: https://pypi.org/simple
+      PIP_INDEX_URL: https://pypi.org/simple
+  windows_windows-smoke:
+    name: Windows smoke + unit
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+    - name: Check out repo
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      with:
+        ref: ${{ inputs.ref }}
+    - name: Set up Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      with:
+        python-version-file: .python-version
+    - name: Set up uv
+      uses: ./.github/actions/setup-uv
+      with:
+        enable-cache: true
+    - name: Install dependencies
+      run: uv sync --locked --group test --extra tracing
+    - name: Import + CLI smoke
+      run: 'uv run python -c "import omnigent; print(''import omnigent OK'')"
+
+        uv run omnigent --help
+
+        '
+    - name: Windows-support unit tests (hard)
+      run: uv run pytest tests/inner/test_proc_and_platform.py tests/runtime/test_process_manager.py -p no:cacheprovider -q
+    - name: Broader unit sweep (non-blocking)
+      continue-on-error: true
+      run: uv run pytest tests/inner tests/runtime/harnesses -m "not posix_only" -p no:cacheprovider -q
+    env:
+      OMNIGENT_SKIP_WEB_UI: 'true'
+      UV_INDEX_URL: https://pypi.org/simple
+      PIP_INDEX_URL: https://pypi.org/simple
