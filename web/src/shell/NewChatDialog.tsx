@@ -1,5 +1,6 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useComposerContext } from "@/hooks/useComposerContext";
+import { useSlashCompletion } from "@/hooks/useSlashCompletion";
 import {
   HarnessPicker,
   HarnessPickerEntry,
@@ -31,10 +32,10 @@ import {
   ChatComposer,
   COMPOSER_COLUMN_WIDTH,
   COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS,
-  ComposerChipRow,
   ComposerFeedbackRow,
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
+import { ComposerMentionChips } from "@/components/composer/ComposerMentionChips";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   MonitorCloudIcon,
@@ -45,7 +46,6 @@ import {
   ChevronsUpDownIcon,
   GitBranchIcon,
   LockIcon,
-  FileTextIcon,
   FolderGit2Icon,
   FolderIcon,
   FolderOpenIcon,
@@ -123,11 +123,7 @@ import {
 export { harnessUnavailableReasonOnHost, harnessUnconfiguredOnHost, harnessWarningBadgeText };
 import { isFeatureEnabled, sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { useHeading, usePoweredBy } from "@/lib/branding";
-import {
-  isSlashCommandText,
-  rankedSlashCommandNames,
-  SlashCommandMenu,
-} from "@/components/SlashCommandMenu";
+import { isSlashCommandText, SlashCommandMenu } from "@/components/SlashCommandMenu";
 import {
   beginLocalConversation,
   hasPendingLocalMessage,
@@ -303,7 +299,6 @@ import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
   buildMentionPreamble,
   detectMentionAt,
-  mentionItemPath,
   type MentionState,
   parseMentionToken,
   rankMentionEntries,
@@ -4603,7 +4598,6 @@ export function NewChatLandingScreen() {
 
   // Pre-session suggestions contain skills; built-ins such as /model need a live session.
   const [inputFocused, setInputFocused] = useState(false);
-  const [slashMenuIndex, setSlashMenuIndex] = useState(-1);
   const skillPrefix = skillsHarness === "codex-native" ? "$" : "/";
   const skillCommands = useMemo(
     () =>
@@ -4612,47 +4606,25 @@ export function NewChatLandingScreen() {
       ),
     [availableSkills, skillPrefix],
   );
-  const trimmedMessage = message.trimStart();
-  const skillNameOnly =
-    (trimmedMessage.startsWith("/") || trimmedMessage.startsWith(skillPrefix)) &&
-    !trimmedMessage.slice(1).includes("/") &&
-    !trimmedMessage.includes(" ");
-  const slashMenuOpen = inputFocused && skillNameOnly;
-  const slashMenuQuery = skillNameOnly ? trimmedMessage.slice(1) : "";
-  // Kept in sync with what SlashCommandMenu renders so keyboard nav
-  // indexes into the same list.
-  const slashMenuMatches = skillNameOnly
-    ? rankedSlashCommandNames(skillCommands, slashMenuQuery)
-    : [];
-  const pendingSkillCompletion =
-    skillNameOnly && skillsStatus === "loading" && slashMenuMatches.length === 0;
-  // New queries select the first match; async arrivals retain the selected name.
-  // Track the previous render in state so discarded renders cannot consume an update.
-  const [previousSlashMatches, setPreviousSlashMatches] = useState<{
-    query: string;
-    names: string[];
-  }>({ query: "", names: [] });
-  if (
-    slashMenuQuery !== previousSlashMatches.query ||
-    slashMenuMatches.length !== previousSlashMatches.names.length ||
-    slashMenuMatches.some((m, i) => m !== previousSlashMatches.names[i])
-  ) {
-    const previousName = previousSlashMatches.names[slashMenuIndex];
-    const retainedIndex =
-      previousSlashMatches.query === slashMenuQuery && previousName
-        ? slashMenuMatches.indexOf(previousName)
-        : -1;
-    setPreviousSlashMatches({ query: slashMenuQuery, names: slashMenuMatches });
-    setSlashMenuIndex(retainedIndex >= 0 ? retainedIndex : slashMenuMatches.length > 0 ? 0 : -1);
-  }
-
   // Selecting a skill fills "/name " and leaves the caret ready for the
   // argument — skills never auto-execute from the menu.
   function applySlashSelection(cmd: string) {
-    setSlashMenuIndex(-1);
     setMessage(cmd + " ");
     textareaRef.current?.focus();
   }
+  const slashCompletion = useSlashCompletion({
+    text: message,
+    commands: skillCommands,
+    prefix: skillPrefix,
+    status: skillsStatus,
+    mobile: isMobileViewport,
+    mobileEnterCompletes: true,
+    escapeClearsOnlyWithContent: false,
+    allowOpen: inputFocused,
+    onSelect: applySlashSelection,
+    clearText: () => setMessage(""),
+  });
+  const pendingSkillCompletion = slashCompletion.pendingCompletion;
 
   // Always-visible skill pills for the allowlisted orchestrators, fed by
   // the same bundled-skills list as the "/" menu.
@@ -6354,49 +6326,11 @@ export function NewChatLandingScreen() {
                   // and takes priority over submission.
                   if (!shouldPreferSendOverCompletion && handleMentionKeyDown(e)) return;
 
-                  if (slashMenuOpen && e.key === "Escape") {
-                    e.preventDefault();
-                    setMessage("");
-                    setSlashMenuIndex(-1);
-                    return;
-                  }
-                  // Keep a partial skill name in the composer until there is a completion.
-                  if (
-                    slashMenuOpen &&
-                    skillsStatus === "loading" &&
-                    slashMenuMatches.length === 0 &&
-                    !shouldPreferSendOverCompletion &&
-                    (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !isMobileViewport))
-                  ) {
-                    e.preventDefault();
-                    return;
-                  }
+                  // Slash-completion menu keys (shared useSlashCompletion) —
+                  // navigate, complete, or dismiss; takes priority over
+                  // submission (same UX as the in-session composer).
+                  if (slashCompletion.handleKey(e, { shouldPreferSendOverCompletion })) return;
 
-                  // While the skills menu is open, ArrowUp/Down navigate it and
-                  // Enter/Tab complete the highlighted item — these take
-                  // priority over submission (same UX as the in-session
-                  // composer).
-                  if (slashMenuOpen && slashMenuMatches.length > 0) {
-                    if (e.key === "ArrowDown") {
-                      e.preventDefault();
-                      setSlashMenuIndex((i) => (i + 1) % slashMenuMatches.length);
-                      return;
-                    }
-                    if (e.key === "ArrowUp") {
-                      e.preventDefault();
-                      setSlashMenuIndex((i) => (i <= 0 ? slashMenuMatches.length - 1 : i - 1));
-                      return;
-                    }
-                    if (
-                      !shouldPreferSendOverCompletion &&
-                      (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) &&
-                      slashMenuIndex >= 0
-                    ) {
-                      e.preventDefault();
-                      applySlashSelection(slashMenuMatches[slashMenuIndex]!);
-                      return;
-                    }
-                  }
                   if (shouldSubmitFromKeyboard) {
                     e.preventDefault();
                     // The mention menu is briefly closed while its listing loads;
@@ -6416,10 +6350,10 @@ export function NewChatLandingScreen() {
                 beforeInput: (
                   <>
                     {/* Skill suggestions — floats above the composer box. */}
-                    {slashMenuOpen && (
+                    {slashCompletion.open && (
                       <SlashCommandMenu
-                        query={slashMenuQuery}
-                        activeIndex={slashMenuIndex}
+                        query={slashCompletion.query}
+                        activeIndex={slashCompletion.index}
                         onSelect={applySlashSelection}
                         commands={skillCommands}
                         skillsStatus={skillsStatus}
@@ -6476,34 +6410,7 @@ export function NewChatLandingScreen() {
                     {/* "@"-mention chips — one per tagged workspace file/folder. Each is
                 delivered as an "[Attached: <path>]" marker prepended to the
                 first message at create time. */}
-                    {mentionedItems.length > 0 && (
-                      <ComposerChipRow className="gap-1.5">
-                        {mentionedItems.map((item, i) => (
-                          <span
-                            key={mentionItemPath(item)}
-                            className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                          >
-                            {item.isDir ? (
-                              <FolderIcon className="size-3 shrink-0" />
-                            ) : (
-                              <FileTextIcon className="size-3 shrink-0" />
-                            )}
-                            <span className="max-w-[200px] truncate" title={mentionItemPath(item)}>
-                              @{item.path}
-                              {item.isDir ? "/" : ""}
-                            </span>
-                            <button
-                              type="button"
-                              onClick={() => removeMentionedItem(i)}
-                              className="ml-0.5 rounded-full hover:text-foreground"
-                              aria-label={`Remove ${item.path}`}
-                            >
-                              <XIcon className="size-3" />
-                            </button>
-                          </span>
-                        ))}
-                      </ComposerChipRow>
-                    )}
+                    <ComposerMentionChips items={mentionedItems} onRemove={removeMentionedItem} />
                     {/* Pending attachments — image thumbnails (click to view) + file rows. */}
                     <ComposerAttachments files={files} onRemove={removeFile} />
                     {/* Rejected-attachment feedback: unsupported type or too large */}
