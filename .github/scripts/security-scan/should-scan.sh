@@ -62,12 +62,14 @@ has_maintainer_waiver() {
   [[ -n "${MAINTAINERS:-}" && -n "${MAINTAINERS// /}" ]] || return 1
   has_skip_label || return 1
 
-  local approvers maint_lc reviewer maintainer
-  approvers=$(gh api "repos/$REPO/pulls/$PR/reviews?per_page=100" --paginate --slurp \
-    --jq '[.[][] | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+  local reviews approvers maint_lc reviewer maintainer
+  reviews=$(gh api "repos/$REPO/pulls/$PR/reviews?per_page=100" \
+    --paginate --slurp 2>/dev/null) || return 1
+  approvers=$(jq -r \
+    '[.[][] | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
       | {login: ((.user.login // "") | ascii_downcase), state, submitted_at, id}]
       | group_by(.login)[] | max_by([.submitted_at, .id])
-      | select(.state == "APPROVED") | .login' 2>/dev/null) || return 1
+      | select(.state == "APPROVED") | .login' <<<"$reviews" 2>/dev/null) || return 1
   maint_lc=$(echo "$MAINTAINERS" | tr '[:upper:]' '[:lower:]')
   for reviewer in $approvers; do
     for maintainer in $maint_lc; do

@@ -57,17 +57,19 @@ fi
 endpoint=$2
 shift 2
 query='.'
+has_query=false
 paginate=false
 slurp=false
 while (( $# )); do
   case "$1" in
-    --jq) query=$2; shift ;;
+    --jq) query=$2; has_query=true; shift ;;
     --paginate) paginate=true ;;
     --slurp) slurp=true ;;
     *) exit 2 ;;
   esac
   shift
 done
+[[ "$slurp" != true || "$has_query" != true ]] || exit 2
 case "$endpoint" in
   'repos/example/project/pulls/42')
     [[ "$WAIVER_FAILURE" != labels ]] || exit 1
