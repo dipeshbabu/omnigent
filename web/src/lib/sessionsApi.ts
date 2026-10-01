@@ -1215,6 +1215,29 @@ export async function getSessionSlim(
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }
 
+export interface SessionSignInLink {
+  pending: boolean;
+  url: string | null;
+  code: string | null;
+}
+
+/**
+ * Ask the session's host for the sign-in prompt its terminal shows right now.
+ *
+ * A link saved in an error card is bound to the launcher process that printed
+ * it and goes stale once that process moves on, so the card asks at click time.
+ */
+export async function getSessionSignInLink(
+  sessionId: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<SessionSignInLink> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/sign-in-link`,
+    { signal: options.signal },
+  );
+  return readJsonOrThrow<SessionSignInLink>(res);
+}
+
 export interface SessionUsageSnapshot {
   id: string;
   totalCostUsd: number | null;
@@ -1441,9 +1464,13 @@ export function openSessionStream(
  * `session.interrupted` (transient) and `response.incomplete` (with
  * `incomplete_details.reason == "user_interrupt"`) on the live
  * stream — clients can mark the bubble interrupted from either.
+ * Native side chats include their observed response id to target the exact turn.
  */
-export function interrupt(sessionId: string): Promise<PostEventResponse> {
-  return postEvent(sessionId, { type: "interrupt", data: {} });
+export function interrupt(sessionId: string, responseId?: string): Promise<PostEventResponse> {
+  return postEvent(sessionId, {
+    type: "interrupt",
+    data: responseId ? { response_id: responseId } : {},
+  });
 }
 
 /**
